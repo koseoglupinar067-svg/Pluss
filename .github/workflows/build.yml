@@ -1,0 +1,207 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+
+          if [ -z "$ZIP" ]; then
+            echo "HATA: Kök dizinde ZIP bulunamadı."
+            exit 1
+          fi
+
+          rm -rf project
+          mkdir -p project
+          unzip -q -o "$ZIP" -d project
+
+          echo "=== Gradle wrapperlar ==="
+          find project -type f -name gradlew -print
+
+      - name: Find Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLEW="$(find project -type f -name gradlew -print -quit)"
+
+          if [ -n "$GRADLEW" ]; then
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+            echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+            echo "Gradle wrapper bulundu: $GRADLEW"
+          else
+            SETTINGS="$(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+
+            if [ -z "$SETTINGS" ]; then
+              echo "HATA: settings.gradle/settings.gradle.kts veya gradlew bulunamadı."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+            echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+            echo "Gradle wrapper yok; sistem Gradle kullanılacak."
+          fi
+
+      - name: Repair Android resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          root = Path("project")
+          fixed = []
+
+          # Android resource merger hatasının yaygın nedeni:
+          # <string name="">...</string>
+          # <item name="">...</item>
+          # vb.
+          name_empty = re.compile(r'\bname\s*=\s*([\'"])\s*\1')
+
+          for p in root.rglob("*.xml"):
+              text = p.read_text(encoding="utf-8", errors="replace")
+
+              if "name=" not in text:
+                  continue
+
+              lines = text.splitlines(keepends=True)
+              out = []
+              changed = False
+
+              for line in lines:
+                  # Boş name içeren tek satırlık resource tanımlarını kaldır.
+                  if name_empty.search(line) and "<resources" not in line:
+                      stripped = line.strip()
+                      if stripped.startswith("<") and not stripped.startswith("</"):
+                          changed = True
+                          continue
+                  out.append(line)
+
+              new_text = "".join(out)
+
+              if changed:
+                  p.write_text(new_text, encoding="utf-8")
+                  fixed.append(str(p))
+
+          print("=== RESOURCE TARAMA ===")
+          if fixed:
+              print("Düzeltilen dosyalar:")
+              for x in fixed:
+                  print(" -", x)
+          else:
+              print("Boş resource name bulunmadı.")
+
+          # Kalan boş name'leri raporla.
+          bad = []
+          for p in root.rglob("*.xml"):
+              text = p.read_text(encoding="utf-8", errors="replace")
+              if name_empty.search(text):
+                  bad.append(str(p))
+
+          if bad:
+              print("Kalan şüpheli XML dosyaları:")
+              for x in bad:
+                  print(" -", x)
+              raise SystemExit("HATA: Boş resource name otomatik olarak temizlenemedi.")
+          PY
+
+      - name: Validate XML resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          errors = []
+
+          for p in Path("project").rglob("*.xml"):
+              try:
+                  ET.parse(p)
+              except Exception as e:
+                  errors.append((p, e))
+
+          if errors:
+              print("=== XML HATALARI ===")
+              for p, e in errors:
+                  print(f"{p}: {e}")
+              raise SystemExit(1)
+
+          print("Tüm XML dosyaları geçerli.")
+          PY
+
+      - name: Make Gradle executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew 2>/dev/null || true
+
+      - name: Build APK
+        shell: bash
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "Build klasörü: $PWD"
+
+          if [ -x "./gradlew" ]; then
+            ./gradlew clean assembleDebug --no-daemon --stacktrace
+          else
+            gradle clean assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Find APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== APK DOSYALARI ==="
+          find project -type f -path '*/build/outputs/apk/debug/*.apk' -print
+
+          COUNT="$(find project -type f -path '*/build/outputs/apk/debug/*.apk' | wc -l)"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "HATA: APK üretilemedi."
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KitenaPlus-APK
+          path: project/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
